@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chrome-lens-search"
+version = "0.1.0"
+description = "Unofficial Google Lens visual product search over plain HTTP: image in, product titles + merchant links out. No SerpApi bill."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "darcodev" }]
+keywords = [
+    "google-lens", "reverse-image-search", "visual-search", "product-search",
+    "web-scraping", "serpapi-alternative", "image-search", "e-commerce",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Multimedia :: Graphics",
+]
+dependencies = [
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+# Needed to run the browser backend and to cold-start the req backend's cookie jar.
+browser = [
+    "undetected-chromedriver>=3.5",
+    "selenium>=4.10",
+]
+# Test/lint tooling; the suite needs no network and no browser.
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+glens = "glens.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/darcodev/chrome-lens-search"
+Repository = "https://github.com/darcodev/chrome-lens-search"
+Issues = "https://github.com/darcodev/chrome-lens-search/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["glens"]
+
+[tool.hatch.build.targets.sdist]
+# Keep CI config and private notes out of the published tarball.
+exclude = [".github", "*.private.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

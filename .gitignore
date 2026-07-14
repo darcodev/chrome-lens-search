@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+env/
+
+# glens runtime artifacts
+.cache/
+*_cookies.json
+cookies.json
+
+# Private maintainer notes (never publish)
+*.private.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
