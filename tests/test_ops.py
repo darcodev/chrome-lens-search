@@ -121,5 +121,18 @@ def test_status_with_jar_reports_age(tmp_path):
     assert 100 < info["jar_age_seconds"] < 600
 
 
+def test_status_jar_without_minted_at_reports_none_age(tmp_path):
+    # A jar copied from another machine (or an older build) may lack "minted_at";
+    # its age is unknown, so status() must report None, not a bogus ~55-year age.
+    jar = tmp_path / "jar.json"
+    jar.write_text(json.dumps({
+        "user_agent": "synthetic-agent/1.0",
+        "cookies": [{"name": "TEST", "value": "1", "domain": ".google.com", "path": "/"}],
+    }), encoding="utf-8")
+    info = glens.status(cookie_file=jar)
+    assert info["jar_valid"] is True and info["req_ready"] is True
+    assert info["jar_age_seconds"] is None
+
+
 def test_status_is_json_safe(tmp_path):
     json.dumps(glens.status(cookie_file=tmp_path / "nope.json"))

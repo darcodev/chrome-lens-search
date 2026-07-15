@@ -813,10 +813,12 @@ def status(cookie_file: str | os.PathLike | None = None) -> dict:
     jar = _load_cookie_jar(cookie_path)
     age: float | None = None
     if jar is not None:
-        try:
-            age = max(0.0, time.time() - float(jar.get("minted_at", 0)))
-        except (TypeError, ValueError):
-            age = None
+        minted_at = jar.get("minted_at")
+        if minted_at is not None:
+            try:
+                age = max(0.0, time.time() - float(minted_at))
+            except (TypeError, ValueError):
+                age = None
     return {
         "cookie_file": str(cookie_path),
         "jar_valid": jar is not None,

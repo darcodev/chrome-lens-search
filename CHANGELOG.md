@@ -2,6 +2,10 @@
 
 Notable changes to chrome-lens-search.
 
+## Unreleased
+
+- Fixed: `status()` now reports `jar_age_seconds` as `None` for a jar that has no `minted_at` timestamp (for example, one copied from another machine), instead of a bogus multi-decade age.
+
 ## 0.1.0
 
 First public release.
