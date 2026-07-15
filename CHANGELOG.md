@@ -4,6 +4,7 @@ Notable changes to chrome-lens-search.
 
 ## Unreleased
 
+- Fixed: a merchant link is no longer dropped when it carries a Google token in its path or query (an affiliate tag like `?utm_source=google.com`, a `&url=` redirect target, a `ved` param). External links are now judged by their host, not by a substring scan of the whole URL.
 - Fixed: `status()` now reports `jar_age_seconds` as `None` for a jar that has no `minted_at` timestamp (for example, one copied from another machine), instead of a bogus multi-decade age.
 
 ## 0.1.0

@@ -165,10 +165,26 @@ class LensResult:
         return data
 
 
+_GOOGLE_HOST_CO = re.compile(r"(^|\.)google\.co($|\.)")
+
+
 def _is_external(href: str) -> bool:
+    """True for a real off-Google link. Judge by the HOST only: a merchant URL
+    that merely carries a Google token in its path or query (an affiliate tag
+    like ``?utm_source=google.com``, a ``&url=`` redirect target, a ``ved``
+    param) is still external and must not be dropped."""
     h = (href or "").lower()
-    return ("://" in h and "google.com" not in h and "gstatic" not in h
-            and ".google/" not in h and "google.co" not in h[:40])
+    if "://" not in h:
+        return False
+    host = _domain_of(h)  # netloc, lowercased, leading 'www.' stripped
+    if not host:
+        return False
+    return not (
+        host == "google" or host.endswith(".google")   # the .google gTLD
+        or "google.com" in host                          # google.com + subdomains
+        or "gstatic" in host                             # *.gstatic.com CDNs
+        or _GOOGLE_HOST_CO.search(host)                  # google.co.uk / .co.jp / ...
+    )
 
 
 def _domain_of(href: str) -> str:

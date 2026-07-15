@@ -1,6 +1,33 @@
 """_to_matches / _to_titles over synthetic anchor items."""
 
-from glens.lens import _to_matches, _to_titles
+import pytest
+
+from glens.lens import _is_external, _to_matches, _to_titles
+
+
+@pytest.mark.parametrize("href", [
+    # A real merchant link that merely carries a Google token in its query or
+    # path must still count as external (the host is what decides).
+    "https://www.example-shop.com/product?utm_source=google.com",
+    "https://shop.example/deal?ved=2ahUKEwi&url=https://google.com/aclk",
+    "https://store.example/google.co-alternatives",
+    "https://a.example/product/1",
+])
+def test_is_external_keeps_merchant_links_with_google_in_query(href):
+    assert _is_external(href) is True
+
+
+@pytest.mark.parametrize("href", [
+    "https://www.google.com/search?q=x",       # google.com + subdomains
+    "https://lens.google.com/uploadbyurl",
+    "https://books.google.co.uk/books?id=1",   # country google.co.* hosts
+    "https://encrypted-tbn0.gstatic.com/img",  # gstatic CDNs
+    "https://blog.google/products/",           # the .google gTLD
+    "relative/path",                           # no scheme -> not a link
+    "https://",                                # no host -> not a link
+])
+def test_is_external_excludes_google_hosts(href):
+    assert _is_external(href) is False
 
 # The exact product repeats across tiles (that's the frequency-ranking signal);
 # one internal link, one junk anchor, and one domain+title duplicate are mixed in.
