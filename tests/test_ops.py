@@ -1,6 +1,7 @@
 """warmup()/status() automation helpers, fake browser, no network."""
 
 import json
+import logging
 import time
 import zlib
 
@@ -71,12 +72,40 @@ def test_warmup_mints_jar_with_synthetic_image(monkeypatch, tmp_path):
 
 
 def test_warmup_force_reminints(monkeypatch, tmp_path):
-    jar = _write_valid_jar(tmp_path / "jar.json")
+    # Seeded a day old, which is why you'd force a re-mint in the first place --
+    # and it keeps "was the jar replaced?" independent of the clock resolution.
+    jar = _write_valid_jar(tmp_path / "jar.json", minted_at=time.time() - 86400)
     calls = []
     monkeypatch.setattr(lens_mod, "_search_via_browser", _minting_browser(jar, calls))
 
     assert glens.warmup(cookie_file=jar, force=True, driver_factory=lambda: None) is True
     assert len(calls) == 1
+    assert json.loads(jar.read_text(encoding="utf-8"))["minted_at"] > time.time() - 60
+
+
+def test_warmup_force_reports_failure_when_remint_fails(monkeypatch, tmp_path, caplog):
+    # The stale jar is still on disk after a failed browser run, so a bare
+    # "does a jar exist?" check reads as success. force=True asked for a *fresh*
+    # session; saying yes here tells a deploy/CI check the fast path was
+    # refreshed when it wasn't, and every later lookup rides the dead jar.
+    jar = _write_valid_jar(tmp_path / "jar.json", minted_at=time.time() - 86400)
+    monkeypatch.setattr(lens_mod, "_search_via_browser", lambda *a: (None, None))
+
+    with caplog.at_level(logging.WARNING, logger="glens"):
+        ok = glens.warmup(cookie_file=jar, force=True, driver_factory=lambda: None)
+
+    assert ok is False
+    assert any("could not re-mint" in r.getMessage() for r in caplog.records)
+    # The old jar is left alone: a dead session still beats no session.
+    assert json.loads(jar.read_text(encoding="utf-8"))["minted_at"] < time.time() - 3600
+
+
+def test_warmup_without_force_still_reports_a_usable_jar(monkeypatch, tmp_path):
+    # Not forcing means "make sure the fast path is ready"; an existing jar
+    # short-circuits before the browser ever runs.
+    jar = _write_valid_jar(tmp_path / "jar.json", minted_at=time.time() - 86400)
+    monkeypatch.setattr(lens_mod, "_search_via_browser", lambda *a: (None, None))
+    assert glens.warmup(cookie_file=jar, driver_factory=lambda: None) is True
 
 
 def test_warmup_uses_supplied_image(monkeypatch, tmp_path):

@@ -51,7 +51,7 @@ It exists because the obvious alternatives don't fit:
 | `chrome-lens-py` and friends | OCR / translation only — no product/shopping matches. |
 | Plain `requests` to Google | Blocked: you get an "enable JavaScript" shell, not results. |
 
-glens talks to Google's **own** Lens upload endpoint (`https://www.google.com/searchbyimage/upload`). The image goes only to Google, never a third-party host.
+glens talks to Google's **own** Lens upload endpoint (`https://lens.google.com/v3/upload`). The image goes only to Google, never a third-party host.
 
 **What you get back** is deliberately *high-recall, noisy* data: Google Lens surfaces the exact product plus a lot of visually-similar and loosely-related links. glens harvests all of it and ranks the product titles by frequency (the exact match repeats across tiles, so it floats to the top). If you need precision, verify matches downstream.
 
@@ -585,7 +585,7 @@ If a lookup that used to work suddenly returns `None` everywhere, Google likely 
 
 For the curious and for contributors. This is the "why" behind the code in [`glens/lens.py`](../glens/lens.py) and [`glens/driver.py`](../glens/driver.py).
 
-**The two legs of a lookup.** Every lookup is (1) an **upload**: a multipart POST of the image to `searchbyimage/upload`, which redirects to a results URL carrying `udm=26`; and (2) a **read** of that results URL to harvest anchors. The browser backend does both from inside Chrome (via in-page `fetch` + DOM harvest); the requests backend does both over `requests`.
+**The two legs of a lookup.** Every lookup is (1) an **upload**: a multipart POST of the image to `lens.google.com/v3/upload`, which redirects to a results URL carrying `udm=26`; and (2) a **read** of that results URL to harvest anchors. The browser backend does both from inside Chrome (it submits an in-page multipart form — a navigation, since a cross-origin `fetch` to the endpoint is CORS-blocked — then harvests the DOM); the requests backend does both over `requests`.
 
 **Why the jar isn't enough — header fingerprinting.** Early on, replaying just the cookies over `requests` still got the JS-gate shell. Live testing showed Google fingerprints the **header surface**, not only cookies: with a bare header set you're gated even with fresh cookies, but with Chrome's full surface (`sec-ch-ua` derived from the jar's User-Agent, `Sec-Fetch-*`, `Referer`/`Origin`, a realistic `Accept`) you get the server-rendered results. `_req_session` mirrors Chrome for exactly this reason.
 

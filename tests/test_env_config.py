@@ -3,7 +3,7 @@ import time by _env_int/_env_flag, which swallow malformed values)."""
 
 import pytest
 
-from glens.lens import _env_flag, _env_int
+from glens.lens import _env_flag, _env_int, _env_str
 
 
 @pytest.mark.parametrize(
@@ -47,3 +47,26 @@ def test_clamped_to_minimum(monkeypatch):
     assert _env_int("GLENS_RESULT_TIMEOUT", 25, minimum=5) == 5
     monkeypatch.setenv("GLENS_MAX_MATCHES", "-3")
     assert _env_int("GLENS_MAX_MATCHES", 20) == 1
+
+
+# ---------------------------------------------------------------------------
+# _env_str (GLENS_BACKEND)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw", ["", "   ", "\n"])
+def test_env_str_blank_returns_default(monkeypatch, raw):
+    # `-e GLENS_BACKEND=` in a container (or an empty .env line) sets the var to
+    # a blank string. That has to mean "not configured", like every other GLENS_*
+    # default -- not an empty backend that fails validation on every lookup.
+    monkeypatch.setenv("GLENS_BACKEND", raw)
+    assert _env_str("GLENS_BACKEND", "auto") == "auto"
+
+
+def test_env_str_unset_returns_default(monkeypatch):
+    monkeypatch.delenv("GLENS_BACKEND", raising=False)
+    assert _env_str("GLENS_BACKEND", "auto") == "auto"
+
+
+def test_env_str_is_normalised(monkeypatch):
+    monkeypatch.setenv("GLENS_BACKEND", "  REQ ")
+    assert _env_str("GLENS_BACKEND", "auto") == "req"

@@ -93,6 +93,19 @@ def test_invalid_backend_raises_value_error():
         glens.search(b"img", backend="warp-drive")
 
 
+@pytest.mark.parametrize("backend", [None, "", "   ", " REQ "])
+def test_blank_backend_argument_falls_back_to_the_default(monkeypatch, tmp_path, backend):
+    # A blank backend is "not specified" -- that's what an unset CLI flag and a
+    # blank GLENS_BACKEND both look like -- not an invalid backend that should
+    # raise. Only a genuinely unknown name is a config error.
+    monkeypatch.setattr(lens_mod, "DEFAULT_BACKEND", "req")
+    monkeypatch.setattr(lens_mod, "_search_via_requests",
+                        lambda *a: (SYNTHETIC_ITEMS, RESULTS_URL))
+    monkeypatch.setattr(lens_mod, "_search_via_browser",
+                        lambda *a: pytest.fail("must not reach the browser"))
+    assert glens.search(b"img", backend=backend, cookie_file=tmp_path / "jar.json")
+
+
 def test_search_many_preserves_order_and_none_entries(monkeypatch, tmp_path):
     monkeypatch.setattr(lens_mod, "_search_via_requests",
                         lambda *a: (SYNTHETIC_ITEMS, RESULTS_URL))
@@ -145,6 +158,48 @@ def test_explicit_zero_caps_are_honoured(monkeypatch, tmp_path):
     result = glens.search(b"img", backend="req", cookie_file=tmp_path / "jar.json",
                           max_matches=0, max_titles=0)
     assert result is None
+
+
+class UploadDriver:
+    """Drives _upload_to_google: submitting the form 'navigates' the address bar."""
+
+    def __init__(self, landed):
+        self.landed = landed
+        self.current_url = "https://www.google.com/"
+        self.scripts = []
+
+    def execute_script(self, script, *args):
+        self.scripts.append((script, args))
+        self.current_url = self.landed
+
+
+def test_upload_submits_a_form_navigation_and_reads_the_url():
+    # A cross-origin fetch() to the endpoint comes back CORS-opaque, so the
+    # upload has to be a top-level navigation and the results URL has to be read
+    # off the address bar afterwards.
+    driver = UploadDriver(RESULTS_URL)
+    assert lens_mod._upload_to_google(driver, b"img", 1) == RESULTS_URL
+
+    script, args = driver.scripts[0]
+    assert "form.submit()" in script and "fetch(" not in script
+    assert "DataTransfer" in script                  # bytes into the file input
+    assert args[1] == lens_mod._UPLOAD_ENDPOINT
+
+
+def test_upload_returns_none_when_the_page_never_moves(monkeypatch):
+    monkeypatch.setattr(lens_mod, "_UPLOAD_GRACE_SECONDS", 0)  # keep the suite quick
+    driver = UploadDriver("https://www.google.com/")   # submit went nowhere
+    assert lens_mod._upload_to_google(driver, b"img", 1) is None
+
+
+def test_upload_returns_none_when_the_script_fails():
+    class Exploding:
+        current_url = "https://www.google.com/"
+
+        def execute_script(self, script, *args):
+            raise RuntimeError("form blocked")
+
+    assert lens_mod._upload_to_google(Exploding(), b"img", 1) is None
 
 
 class FakeDriver:

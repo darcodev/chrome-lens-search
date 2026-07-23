@@ -5,7 +5,7 @@ Lens libraries only do OCR/translation, and hitting Lens from a plain server jus
 gets you blocked. This sends the image straight to Google's own Lens upload
 endpoint and reads the product matches back.
 
-Every lookup is two steps: POST the image to searchbyimage/upload (the
+Every lookup is two steps: POST the image to lens.google.com/v3/upload (the
 ``encoded_image`` field), which redirects to a results URL carrying ``&udm=26``;
 then read that URL and scrape the result anchors. The image only ever touches
 Google, never a third-party host.
@@ -17,9 +17,10 @@ Two backends (``backend=`` / ``GLENS_BACKEND``, default "auto"):
            JS-verified session, so a cold client gets an "enable JS" shell; with
            the browser's cookies, though, the raw HTML has everything we need. If
            the jar is missing or stale, the browser path runs and re-mints it.
-  browser  drives undetected-chromedriver, uploads via an in-page fetch, renders
-           the page and scrapes the anchors. Every good run saves the google.com
-           cookies + UA back to the jar so req can reuse them.
+  browser  drives undetected-chromedriver, uploads by submitting an in-page
+           multipart form (a navigation, so the cross-origin POST isn't blocked
+           by CORS), renders the page and scrapes the anchors. Every good run
+           saves the google.com cookies + UA back to the jar so req can reuse them.
   auto     req first, browser as a fallback. This is the default.
 
 The parser stays selector-light on purpose. Lens markup uses randomized, rotating
@@ -58,6 +59,13 @@ def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_str(name: str, default: str) -> str:
+    """Read a lowercased string env default. Blank means "not configured": a
+    container's ``-e GLENS_FOO=`` (or an empty line in a .env) must land on the
+    default, never on an empty setting."""
+    return os.getenv(name, "").strip().lower() or default
+
+
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
     """Read an int env default; malformed values must never break `import glens`."""
     raw = os.getenv(name, "").strip()
@@ -70,7 +78,7 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
         return default
 
 
-DEFAULT_BACKEND = os.getenv("GLENS_BACKEND", "auto").strip().lower()
+DEFAULT_BACKEND = _env_str("GLENS_BACKEND", "auto")
 DEFAULT_MAX_MATCHES = _env_int("GLENS_MAX_MATCHES", 20)
 DEFAULT_MAX_TITLES = _env_int("GLENS_MAX_TITLES", 6)
 DEFAULT_RESULT_TIMEOUT = _env_int("GLENS_RESULT_TIMEOUT", 25, minimum=5)
@@ -81,6 +89,9 @@ DEFAULT_CACHE_TTL = _env_int("GLENS_CACHE_TTL", 86400)
 _VALID_BACKENDS = ("auto", "req", "browser")
 _REQ_ATTEMPTS = 2
 _REQ_BACKOFF_SECONDS = 1.5
+# Headroom on top of the caller's timeout for the upload navigation itself
+# (POST the image, follow Google's redirect) before the results page has to load.
+_UPLOAD_GRACE_SECONDS = 30
 
 
 def _default_cookie_file() -> Path:
@@ -97,7 +108,12 @@ def _default_cache_dir() -> Path:
     return Path.home() / ".cache" / "glens" / "results"
 
 
-_UPLOAD_ENDPOINT = "https://www.google.com/searchbyimage/upload"
+# Lens' own upload endpoint. The old reverse-image-search one
+# (www.google.com/searchbyimage/upload) now answers 404 for everything, which
+# took every lookup down with it; this one still redirects to the &udm=26
+# results URL both backends expect (re-verified live 2026-07).
+_UPLOAD_ENDPOINT = "https://lens.google.com/v3/upload"
+_LANDING_PAGE = "https://www.google.com/"
 _REQ_UA_FALLBACK = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
@@ -314,6 +330,21 @@ def _load_cookie_jar(cookie_file: Path) -> dict | None:
         return None
 
 
+def _jar_stamp(cookie_file: Path) -> tuple | None:
+    """Identity of the jar on disk, so a caller can tell a freshly minted jar
+    from the leftover it was meant to replace. ``None`` when there's no valid
+    jar. Two signals because either can be absent or coarse: ``minted_at`` is
+    missing on a hand-copied jar, and filesystem mtimes are low-resolution."""
+    jar = _load_cookie_jar(cookie_file)
+    if jar is None:
+        return None
+    try:
+        mtime = cookie_file.stat().st_mtime_ns
+    except OSError:
+        mtime = 0
+    return (jar.get("minted_at"), mtime)
+
+
 def _ua_platform(user_agent: str) -> str:
     if "Macintosh" in user_agent:
         return "macOS"
@@ -370,8 +401,14 @@ _HTML_ARIA_RE = re.compile(r"""aria-label\s*=\s*["']([^"']*)["']""", re.IGNORECA
 
 
 def _unwrap_google_redirect(href: str) -> str:
-    """google.com/url?q=<target> -> <target> (raw HTML wraps merchant links)."""
-    if "/url?" not in href:
+    """``google.com/url?q=<target>`` -> ``<target>``.
+
+    Google wraps merchant links this way in the raw HTML *and* in the rendered
+    DOM, so both harvests run hrefs through here. Only Google's own wrapper is
+    unwrapped — ``_is_external`` is false for exactly the Google hosts — so a
+    merchant that happens to have its own ``/url?q=`` route keeps its link.
+    """
+    if "/url?" not in href or _is_external(href):
         return href
     try:
         params = parse_qs(urlparse(href).query)
@@ -498,31 +535,68 @@ def _dismiss_consent(driver) -> None:
 def _upload_to_google(driver, frame_bytes: bytes, result_timeout: int,
                       endpoint: str = _UPLOAD_ENDPOINT) -> str | None:
     """UPLOAD step from inside the browser (cookies/session match the page we'll
-    render). Returns the ``&udm=26`` results URL, or None."""
+    render). Returns the ``&udm=26`` results URL, or None.
+
+    Submits a real multipart form so the POST is a top-level *navigation*. An
+    in-page ``fetch`` can't do this job: the endpoint is on lens.google.com while
+    Google lands the session on www.google.com, so the upload is cross-origin and
+    the response comes back CORS-opaque ("TypeError: Failed to fetch").
+    Navigations aren't subject to CORS, and the redirect target is then simply
+    the browser's own URL.
+    """
     b64 = base64.b64encode(frame_bytes).decode()
     try:
-        driver.set_script_timeout(result_timeout + 30)
-        result = driver.execute_async_script(
+        before = driver.current_url or ""
+        driver.execute_script(
             r"""
-            const b64 = arguments[0], endpoint = arguments[1], done = arguments[arguments.length-1];
-            try {
-                const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-                const fd = new FormData();
-                fd.append('encoded_image', new Blob([bytes], {type:'image/jpeg'}), 'frame.jpg');
-                fetch(endpoint, {method:'POST', body:fd, redirect:'follow'})
-                    .then(r => done({url: r.url, status: r.status}))
-                    .catch(e => done({error: String(e)}));
-            } catch (e) { done({error: String(e)}); }
+            const b64 = arguments[0], endpoint = arguments[1];
+            const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = endpoint;
+            form.enctype = 'multipart/form-data';
+            const file = document.createElement('input');
+            file.type = 'file';
+            file.name = 'encoded_image';
+            // A file input's .files is read-only; DataTransfer is the only way
+            // to hand it bytes we generated rather than a user's pick.
+            const dt = new DataTransfer();
+            dt.items.add(new File([bytes], 'frame.jpg', {type: 'image/jpeg'}));
+            file.files = dt.files;
+            form.appendChild(file);
+            const src = document.createElement('input');
+            src.type = 'hidden';
+            src.name = 'sbisrc';
+            src.value = 'Google Chrome';
+            form.appendChild(src);
+            document.body.appendChild(form);
+            form.submit();
             """,
             b64, endpoint,
         )
     except Exception as exc:
         logger.info("glens upload failed: %s", exc)
         return None
-    if not result or result.get("error") or not result.get("url"):
-        logger.info("glens upload returned no results URL (%s)", result)
+
+    # Poll the address bar for the redirect target. Keep the newest changed URL
+    # but stop early on one that actually looks like a results page, so a slow
+    # intermediate hop can't be mistaken for the destination.
+    settled = ""
+    deadline = time.time() + result_timeout + _UPLOAD_GRACE_SECONDS
+    while time.time() < deadline:
+        try:
+            current = driver.current_url or ""
+        except Exception:
+            current = ""
+        if current and current != before and not current.startswith(endpoint):
+            settled = current
+            if "udm=26" in current or "lens" in current:
+                break
+        time.sleep(0.5)
+    if not settled:
+        logger.info("glens upload returned no results URL (still on %s)", before[:120])
         return None
-    return result["url"]
+    return settled
 
 
 def _harvest_anchors(driver) -> list[dict]:
@@ -541,6 +615,12 @@ def _harvest_anchors(driver) -> list[dict]:
     except Exception as exc:
         logger.info("glens anchor harvest failed: %s", exc)
         return []
+    # The rendered DOM carries the same google.com/url?q= wrappers the raw HTML
+    # does. Unwrap here, exactly as the req backend does, or _is_external() reads
+    # a wrapped merchant link as google.com's own and drops every match the
+    # browser pass just found — silently gutting the self-healing fallback.
+    for item in items or []:
+        item["href"] = _unwrap_google_redirect(item.get("href") or "")
     return items or []
 
 
@@ -556,11 +636,20 @@ def _render_and_harvest(driver, results_url: str, result_timeout: int, wait_read
     _dismiss_consent(driver)
 
     def _has_products(drv):
+        # Counts wrapped tiles (google.com/url?q=<merchant>) as products too;
+        # otherwise a page that wraps every link never satisfies the wait and we
+        # burn the whole timeout before harvesting results that were long ready.
         try:
             return drv.execute_script(
-                "return Array.from(document.querySelectorAll('a[href]'))"
-                ".filter(a => a.href && a.href.includes('://')"
-                " && !a.href.includes('google.com')).length"
+                r"""
+                return Array.from(document.querySelectorAll('a[href]')).filter(a => {
+                    const h = a.href || '';
+                    if (!h.includes('://')) return false;
+                    if (!h.includes('google.com')) return true;
+                    return h.includes('/url?')
+                           && (h.includes('q=http') || h.includes('url=http'));
+                }).length;
+                """
             ) > 5
         except Exception:
             return False
@@ -603,7 +692,7 @@ def _browser_pass(frame_bytes: bytes, cookie_file: Path, result_timeout: int,
     driver = None
     try:
         driver = driver_factory()
-        driver.get("https://www.google.com/")
+        driver.get(_LANDING_PAGE)
         try:
             wait_for_document_ready(driver)
         except Exception:
@@ -726,7 +815,7 @@ def search(
     ordinary network/parse failures; an unknown ``backend`` raises ``ValueError``
     (that's a config bug, not a lookup failure).
     """
-    backend = (backend or DEFAULT_BACKEND).strip().lower()
+    backend = (backend or "").strip().lower() or DEFAULT_BACKEND
     if backend not in _VALID_BACKENDS:
         raise ValueError(f"backend must be one of {_VALID_BACKENDS!r}, not {backend!r}")
     max_matches = DEFAULT_MAX_MATCHES if max_matches is None else max_matches
@@ -863,7 +952,10 @@ def warmup(
     exists, unless ``force=True``. ``image`` defaults to a tiny synthetic PNG;
     the upload content doesn't matter, only the JS-verified session it creates.
 
-    Returns True when the jar is ready. Never raises for ordinary failures.
+    Returns True when the jar is ready — and for ``force=True``, only when this
+    run actually re-minted it: a failed re-mint leaves the old (presumed stale)
+    jar on disk, and reporting that as success would tell a deploy check the
+    session was refreshed when it wasn't. Never raises for ordinary failures.
     """
     cookie_path = Path(cookie_file) if cookie_file else _default_cookie_file()
     if not force and _load_cookie_jar(cookie_path) is not None:
@@ -891,6 +983,16 @@ def warmup(
 
     # A junk image renders few tiles, so there's no point waiting long: any
     # rendered results page mints the cookies we're after.
+    before = _jar_stamp(cookie_path)
     with _lens_lock:
         _search_via_browser(frame_bytes, cookie_path, timeout or 10, driver_factory)
-    return _load_cookie_jar(cookie_path) is not None
+    after = _jar_stamp(cookie_path)
+    if after is None:
+        return False
+    if force and after == before:
+        # The jar on disk is the one we set out to replace: the browser pass
+        # never got a page good enough to save cookies from.
+        logger.warning("glens: warmup(force=True) could not re-mint the session jar; "
+                       "the existing one was left in place.")
+        return False
+    return True
