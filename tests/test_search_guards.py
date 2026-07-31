@@ -323,6 +323,47 @@ def test_headless_degraded_page_retries_headed(monkeypatch, tmp_path):
     assert items == RENDERED_ITEMS
 
 
+def _wire_two_passes(monkeypatch, first, second):
+    """Fake browser passes returning `first` then `second`, with the headed retry
+    forced on. Returns the list of harvests handed back, in order."""
+    harvests = [first, second]
+    monkeypatch.setattr(lens_mod, "_dismiss_consent", lambda driver: None)
+    monkeypatch.setattr(lens_mod, "_upload_to_google",
+                        lambda driver, frame, timeout, endpoint=None: RESULTS_URL)
+    monkeypatch.setattr(lens_mod, "_save_cookie_jar", lambda driver, cookie_file: None)
+    monkeypatch.setattr(lens_mod, "_render_and_harvest",
+                        lambda driver, url, timeout, wait: harvests.pop(0))
+    monkeypatch.setattr(lens_mod, "_headed_retry_allowed", lambda factory: True)
+    monkeypatch.setattr("glens.driver.build_driver",
+                        lambda headless=None, **kwargs: FakeDriver())
+    monkeypatch.setattr("glens.driver.wait_for_document_ready", lambda driver: None)
+
+
+def test_failed_headed_retry_keeps_the_first_passs_harvest(monkeypatch, tmp_path):
+    # The visible-window retry can't open on a display-less box (the documented
+    # headless-server case) and Google can answer the second upload with an
+    # interstitial. Overwriting unconditionally turns a degraded-but-usable
+    # harvest into None -- the fallback must never trade down.
+    _wire_two_passes(monkeypatch, SYNTHETIC_ITEMS, [])
+
+    items, url = lens_mod._search_via_browser(b"img", tmp_path / "jar.json", 5,
+                                              lambda: FakeDriver())
+
+    assert items == SYNTHETIC_ITEMS
+    assert url == RESULTS_URL
+
+
+def test_headed_retry_wins_when_it_harvests_more(monkeypatch, tmp_path):
+    # Neither pass rendered a full page, but the headed one got further: take it.
+    better = SYNTHETIC_ITEMS + [{"href": "https://d.example/p/4", "text": "Another Gadget"}]
+    _wire_two_passes(monkeypatch, SYNTHETIC_ITEMS[:1], better)
+
+    items, _ = lens_mod._search_via_browser(b"img", tmp_path / "jar.json", 5,
+                                            lambda: FakeDriver())
+
+    assert items == better
+
+
 def test_headed_retry_respects_pinned_env(monkeypatch):
     monkeypatch.setenv("GLENS_HEADLESS", "1")
     assert lens_mod._headed_retry_allowed(lambda: None) is False

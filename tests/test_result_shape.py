@@ -29,6 +29,33 @@ def test_is_external_keeps_merchant_links_with_google_in_query(href):
 def test_is_external_excludes_google_hosts(href):
     assert _is_external(href) is False
 
+
+@pytest.mark.parametrize("href", [
+    "https://www.google.de/search?q=x",
+    "https://www.google.fr/imghp",
+    "https://images.google.it/",
+    "https://www.google.com.br/search?q=x",
+    "https://www.google.co/",                  # google.co (Colombia)
+])
+def test_is_external_excludes_every_google_country_host(href):
+    # Google's own links are internal whichever country domain the session
+    # landed on -- not just the google.com / google.co.* ones. Counting them as
+    # merchant links fills matches with Google's own chrome AND fools the req
+    # backend's "enough external anchors?" gate check into trusting a gated page.
+    assert _is_external(href) is False
+
+
+@pytest.mark.parametrize("href", [
+    "https://notgoogle.com/deal",
+    "https://mygstatic.com/product/1",
+    "https://google.com.cheap-deals.example/p",   # google.com only as a label prefix
+])
+def test_is_external_keeps_hosts_that_merely_contain_a_google_name(href):
+    # The host has to *be* Google's, not merely contain the string: matching a
+    # substring drops a real merchant link, which is the same class of bug that
+    # moving the check from the whole URL onto the host was meant to fix.
+    assert _is_external(href) is True
+
 # The exact product repeats across tiles (that's the frequency-ranking signal);
 # one internal link, one junk anchor, and one domain+title duplicate are mixed in.
 ITEMS = [

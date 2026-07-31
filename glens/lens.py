@@ -181,7 +181,13 @@ class LensResult:
         return data
 
 
-_GOOGLE_HOST_CO = re.compile(r"(^|\.)google\.co($|\.)")
+# Google's own hosts, matched on LABEL boundaries: ``google.<tld>`` and
+# ``google.<tld>.<tld>`` (google.com, google.de, google.co.uk, google.com.br)
+# plus any subdomain of those, and the gstatic CDNs. Boundaries matter in both
+# directions -- a bare substring scan reads the merchant host "notgoogle.com" as
+# Google's and drops a real match, while missing google.de entirely because it
+# only ever looked for "google.com"/"google.co".
+_GOOGLE_HOST = re.compile(r"(^|\.)(google(\.[a-z]{2,3}){1,2}|gstatic(\.[a-z]{2,3}){1,2})$")
 
 
 def _is_external(href: str) -> bool:
@@ -197,9 +203,7 @@ def _is_external(href: str) -> bool:
         return False
     return not (
         host == "google" or host.endswith(".google")   # the .google gTLD
-        or "google.com" in host                          # google.com + subdomains
-        or "gstatic" in host                             # *.gstatic.com CDNs
-        or _GOOGLE_HOST_CO.search(host)                  # google.co.uk / .co.jp / ...
+        or _GOOGLE_HOST.search(host)                   # google.<tld> + subdomains, gstatic
     )
 
 
@@ -731,7 +735,13 @@ def _search_via_browser(frame_bytes: bytes, cookie_file: Path, result_timeout: i
 
     Returns ``(items, results_url)``, or ``(None, ...)`` on failure. When headless
     Chrome gets a degraded page (Google gates headless sessions), retries once
-    with a visible window (bundled driver only; opt out via GLENS_HEADLESS).
+    with a visible window (bundled driver only; opt out via GLENS_HEADLESS). The
+    retry can only improve the outcome: it's kept when it rendered a real page or
+    simply harvested more, never when it did worse. A visible window can't open
+    on a display-less box (the documented headless-server case) and Google can
+    answer the second upload with an interstitial, so an unconditional overwrite
+    would throw away anchors the first pass already had -- turning a degraded but
+    usable result into ``None``.
     """
     items, results_url = _browser_pass(frame_bytes, cookie_file, result_timeout,
                                        driver_factory)
@@ -739,8 +749,13 @@ def _search_via_browser(frame_bytes: bytes, cookie_file: Path, result_timeout: i
         logger.warning("glens: headless Chrome got a degraded page; retrying once "
                        "with a visible Chrome window.")
         from .driver import build_driver
-        items, results_url = _browser_pass(frame_bytes, cookie_file, result_timeout,
-                                           lambda: build_driver(headless=False))
+        retry_items, retry_url = _browser_pass(frame_bytes, cookie_file, result_timeout,
+                                               lambda: build_driver(headless=False))
+        if _looks_rendered(retry_items) or len(retry_items or []) > len(items or []):
+            items, results_url = retry_items, retry_url
+        else:
+            logger.info("glens: the visible-window retry did no better (%d anchor(s)); "
+                        "keeping the first pass.", len(retry_items or []))
     return items, results_url
 
 
