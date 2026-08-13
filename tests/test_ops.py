@@ -165,3 +165,73 @@ def test_status_jar_without_minted_at_reports_none_age(tmp_path):
 
 def test_status_is_json_safe(tmp_path):
     json.dumps(glens.status(cookie_file=tmp_path / "nope.json"))
+
+
+# ---------------------------------------------------------------------------
+# _save_cookie_jar
+# ---------------------------------------------------------------------------
+
+class _FakeCookieDriver:
+    def __init__(self, cookies):
+        self._cookies = cookies
+
+    def get_cookies(self):
+        return self._cookies
+
+    def execute_script(self, _script):
+        return "synthetic-agent/1.0"
+
+
+def test_save_cookie_jar_keeps_only_real_google_domains(tmp_path):
+    # A substring scan for "google" also swept up cookies set by unrelated hosts
+    # that merely contain the word, writing a third party's cookies into our jar.
+    driver = _FakeCookieDriver([
+        {"name": "SID", "value": "1", "domain": ".google.com", "path": "/"},
+        {"name": "NID", "value": "2", "domain": "www.google.co.uk", "path": "/"},
+        {"name": "spoof", "value": "3", "domain": "notgoogle.com", "path": "/"},
+        {"name": "spoof2", "value": "4", "domain": "google.com.cheap.example", "path": "/"},
+    ])
+    jar_path = tmp_path / "jar.json"
+    lens_mod._save_cookie_jar(driver, jar_path)
+
+    saved = json.loads(jar_path.read_text(encoding="utf-8"))
+    assert [c["name"] for c in saved["cookies"]] == ["SID", "NID"]
+
+
+def test_save_cookie_jar_leaves_no_stray_temp_file(tmp_path):
+    driver = _FakeCookieDriver(
+        [{"name": "SID", "value": "1", "domain": ".google.com", "path": "/"}]
+    )
+    jar_path = tmp_path / "jar.json"
+    lens_mod._save_cookie_jar(driver, jar_path)
+
+    assert lens_mod._load_cookie_jar(jar_path) is not None
+    assert [p.name for p in tmp_path.iterdir()] == ["jar.json"]
+
+
+def test_save_cookie_jar_never_truncates_a_good_jar_on_failure(tmp_path, monkeypatch):
+    # Writing in place meant a crash or a full disk mid-write left an unloadable
+    # half-jar behind, taking out the fast path the run meant to refresh.
+    jar_path = _write_valid_jar(tmp_path / "jar.json", minted_at=1000.0)
+    before = jar_path.read_text(encoding="utf-8")
+
+    def explode(self, *args, **kwargs):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(lens_mod.Path, "write_text", explode)
+    lens_mod._save_cookie_jar(
+        _FakeCookieDriver([{"name": "SID", "value": "1", "domain": ".google.com", "path": "/"}]),
+        jar_path,
+    )
+
+    assert jar_path.read_text(encoding="utf-8") == before
+    assert lens_mod._load_cookie_jar(jar_path) is not None
+
+
+def test_save_cookie_jar_no_google_cookies_writes_nothing(tmp_path):
+    jar_path = tmp_path / "jar.json"
+    lens_mod._save_cookie_jar(
+        _FakeCookieDriver([{"name": "x", "value": "1", "domain": "example.com", "path": "/"}]),
+        jar_path,
+    )
+    assert not jar_path.exists()

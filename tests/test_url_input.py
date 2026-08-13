@@ -54,10 +54,12 @@ def test_non_url_string_never_hits_downloader(monkeypatch, tmp_path):
 
 
 class _FakeHTTP:
-    def __init__(self, content=b"img-bytes", status=200, exc=None):
+    def __init__(self, content=b"img-bytes", status=200, exc=None,
+                 content_type="image/jpeg"):
         self.content = content
         self.status = status
         self.exc = exc
+        self.headers = {"Content-Type": content_type} if content_type else {}
 
     def get(self, url, **kwargs):
         if self.exc:
@@ -88,3 +90,21 @@ def test_download_image_swallows_transport_error(monkeypatch):
 def test_download_image_empty_body_is_none(monkeypatch):
     monkeypatch.setattr(lens_mod.requests, "get", _FakeHTTP(content=b"").get)
     assert lens_mod._download_image("https://example.com/a.jpg") is None
+
+
+def test_download_image_rejects_soft_404_html(monkeypatch):
+    # A host answering 200 with an HTML error page: uploading that to Lens as a
+    # JPEG just yields a confusing empty result for what is really a dead link.
+    monkeypatch.setattr(lens_mod.requests, "get",
+                        _FakeHTTP(content=b"<html>404</html>",
+                                  content_type="text/html; charset=utf-8").get)
+    assert lens_mod._download_image("https://example.com/missing.jpg") is None
+
+
+def test_download_image_allows_untyped_and_octet_stream(monkeypatch):
+    # Plenty of CDNs serve real images this way; only clearly non-image bodies
+    # are refused, so these must still go through.
+    for content_type in ("application/octet-stream", "", None):
+        monkeypatch.setattr(lens_mod.requests, "get",
+                            _FakeHTTP(content=b"jpeg!", content_type=content_type).get)
+        assert lens_mod._download_image("https://example.com/a.jpg") == b"jpeg!"

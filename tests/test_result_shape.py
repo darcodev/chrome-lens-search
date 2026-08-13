@@ -2,7 +2,7 @@
 
 import pytest
 
-from glens.lens import _is_external, _to_matches, _to_titles
+from glens.lens import _domain_of, _is_external, _to_matches, _to_titles
 
 
 @pytest.mark.parametrize("href", [
@@ -55,6 +55,29 @@ def test_is_external_keeps_hosts_that_merely_contain_a_google_name(href):
     # substring drops a real merchant link, which is the same class of bug that
     # moving the check from the whole URL onto the host was meant to fix.
     assert _is_external(href) is True
+
+
+@pytest.mark.parametrize("href", [
+    "https://www.google.com:443/url?q=https://shop.example/x",
+    "https://google.com:443/search?q=x",
+    "https://lens.google.com:8443/uploadbyurl",
+])
+def test_is_external_excludes_google_hosts_carrying_a_port(href):
+    # The host check anchors on the end of the name, so a port kept in the host
+    # ("google.com:443") slipped past it. Google's own link then counted as a
+    # merchant match, and its /url?q= wrapper never got unwrapped.
+    assert _is_external(href) is False
+
+
+@pytest.mark.parametrize(("href", "expected"), [
+    ("https://shop.example.com:8443/p/1", "shop.example.com"),
+    ("https://user:pw@shop.example.com/p/1", "shop.example.com"),
+    ("https://WWW.Shop.Example.COM/p/1", "shop.example.com"),
+])
+def test_domain_of_reports_a_bare_hostname(href, expected):
+    # Match.domain is user-facing; a port or userinfo riding along makes it
+    # useless for grouping ("shop.example.com" vs "shop.example.com:8443").
+    assert _domain_of(href) == expected
 
 # The exact product repeats across tiles (that's the frequency-ranking signal);
 # one internal link, one junk anchor, and one domain+title duplicate are mixed in.

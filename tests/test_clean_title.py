@@ -2,7 +2,13 @@
 
 import pytest
 
-from glens.lens import _clean_title, _is_junk_title
+from glens.lens import (
+    _clean_title,
+    _is_domain_only,
+    _is_junk_title,
+    _to_matches,
+    _to_titles,
+)
 
 
 @pytest.mark.parametrize(
@@ -28,6 +34,19 @@ from glens.lens import _clean_title, _is_junk_title
         ("Acme Widget Pro · In stock", "Acme Widget Pro"),
         # Whitespace collapses.
         ("  Acme   Widget\n Pro  ", "Acme Widget Pro"),
+        # A bare merchant host ahead of the product name, with or without Lens'
+        # "(+N)" more-sellers badge, is a label -- not part of the title.
+        ("thepremierstore.com (+1) - Acme Widget Pro", "Acme Widget Pro"),
+        ("shop.example.co.uk Acme Widget Pro", "Acme Widget Pro"),
+        ("acmestore.com: Acme Widget Pro", "Acme Widget Pro"),
+        # Google flattens the result breadcrumb into the aria-label; everything
+        # from the URL onward is chrome.
+        ("Acme Widget Pro Acme https://www.acme.com › shoes", "Acme Widget Pro Acme"),
+        ("Acme Widget Pro www.acme.com", "Acme Widget Pro"),
+        ("Acme Widget Pro › Shoes", "Acme Widget Pro"),
+        # Dotted names that are NOT hosts must survive untouched.
+        ("U.S. Polo Assn Shirt", "U.S. Polo Assn Shirt"),
+        ("St. Louis Blues Jersey", "St. Louis Blues Jersey"),
         # Everything at once: prefix + rating + UI suffix.
         ("Amazon.com Acme Widget Pro 4.7(20) Opens in new tab", "Acme Widget Pro"),
         ("", ""),
@@ -35,6 +54,32 @@ from glens.lens import _clean_title, _is_junk_title
 )
 def test_clean_title(raw, expected):
     assert _clean_title(raw) == expected
+
+
+@pytest.mark.parametrize("host", ["Amazon.com", "thepremierstore.com",
+                                  "www.shop.example.co.uk", "nike.com"])
+def test_domain_only_titles_are_not_product_names(host):
+    assert _is_domain_only(host)
+
+
+@pytest.mark.parametrize("real", ["Acme Widget Pro", "U.S. Polo Assn Shirt",
+                                  "Runner 9 Trail Shoe (Blue)", "Killshot 2"])
+def test_domain_only_leaves_real_titles_alone(real):
+    assert not _is_domain_only(real)
+
+
+def test_domain_only_titles_are_dropped_from_the_ranking():
+    # Enough same-merchant tiles and a bare host outranks the actual product,
+    # landing in top_title. The anchors themselves are still real links, so
+    # _to_matches keeps them -- only the *ranking* screens them out.
+    items = [
+        {"href": "https://www.amazon.com/dp/A1", "text": "Amazon.com"},
+        {"href": "https://www.amazon.com/dp/A2", "text": "Amazon.com"},
+        {"href": "https://www.amazon.com/dp/A3", "text": "Amazon.com"},
+        {"href": "https://a.example/p/1", "text": "Acme Widget Pro Runner"},
+    ]
+    assert _to_titles(items, 6) == ["Acme Widget Pro Runner"]
+    assert any(m.domain == "amazon.com" for m in _to_matches(items, 20))
 
 
 @pytest.mark.parametrize(

@@ -131,6 +131,23 @@ _JUNK_EXACT = {"read more", "view related links", "opens in new tab", "see more"
                "shop now", "related links", "view product", "product", ""}
 _JUNK_CONTAINS = ("new arrivals & restocks", "let us know your")
 
+# A bare merchant host, optionally with Lens' "(+2)" more-sellers badge and a
+# dash, ahead of the actual product name ("thepremierstore.com (+1) - Killshot
+# 2"). _MARKETPLACE_PREFIX only knows the named marketplaces and www.-prefixed
+# hosts, so a plain shop domain used to survive into the title.
+_DOMAIN_PREFIX = re.compile(
+    r"^(?:www\.)?[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.[a-z]{2,}"
+    r"(?:\s*\(\+\d+\))?\s*[-–—:]?\s+",
+    re.IGNORECASE,
+)
+# The whole title is just a hostname -- a merchant label, not a product name.
+_BARE_DOMAIN = re.compile(
+    r"^(?:www\.)?[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.[a-z]{2,}$", re.IGNORECASE
+)
+# Google's result breadcrumb ("... Nike https://www.nike.com > Shoes") gets
+# flattened into the aria-label; everything from the URL on is chrome, not title.
+_EMBEDDED_URL = re.compile(r"\s*(?:https?://|www\.)\S*.*$", re.IGNORECASE)
+
 _lens_lock = threading.Lock()
 
 
@@ -190,6 +207,22 @@ class LensResult:
 _GOOGLE_HOST = re.compile(r"(^|\.)(google(\.[a-z]{2,3}){1,2}|gstatic(\.[a-z]{2,3}){1,2})$")
 
 
+def _is_google_host(host: str) -> bool:
+    """True when a bare hostname (or a cookie's domain attribute) is Google's.
+
+    The single place that answers "is this Google's?", so link classification and
+    cookie-jar minting can't drift apart. A leading dot is a cookie-domain thing
+    (``.google.com``), not part of the name, so strip it first.
+    """
+    h = (host or "").lower().strip().lstrip(".")
+    if not h:
+        return False
+    return (
+        h == "google" or h.endswith(".google")   # the .google gTLD
+        or bool(_GOOGLE_HOST.search(h))          # google.<tld> + subdomains, gstatic
+    )
+
+
 def _is_external(href: str) -> bool:
     """True for a real off-Google link. Judge by the HOST only: a merchant URL
     that merely carries a Google token in its path or query (an affiliate tag
@@ -198,18 +231,24 @@ def _is_external(href: str) -> bool:
     h = (href or "").lower()
     if "://" not in h:
         return False
-    host = _domain_of(h)  # netloc, lowercased, leading 'www.' stripped
+    host = _domain_of(h)  # hostname, lowercased, leading 'www.' stripped
     if not host:
         return False
-    return not (
-        host == "google" or host.endswith(".google")   # the .google gTLD
-        or _GOOGLE_HOST.search(host)                   # google.<tld> + subdomains, gstatic
-    )
+    return not _is_google_host(host)
 
 
 def _domain_of(href: str) -> str:
+    """Bare hostname of a URL, lowercased, with a leading ``www.`` dropped.
+
+    Deliberately ``hostname`` and not ``netloc``: netloc keeps the port and any
+    userinfo, and both wreck the Google check downstream, which anchors on the
+    end of the host. ``https://www.google.com:443/url?q=...`` would read as the
+    merchant host "google.com:443" -- external -- so its wrapper never gets
+    unwrapped and Google's own link is served up as a product match. It also
+    kept the port/userinfo in the user-facing ``Match.domain``.
+    """
     try:
-        return (urlparse(href).netloc or "").lower().removeprefix("www.")
+        return (urlparse(href).hostname or "").lower().removeprefix("www.")
     except Exception:
         return ""
 
@@ -220,11 +259,13 @@ def _clean_title(text: str) -> str:
         if sep in t:
             t = t.split(sep)[0].strip()
     t = _MARKETPLACE_PREFIX.sub("", t)
+    t = _DOMAIN_PREFIX.sub("", t)
     t = re.sub(r"\b(Opens in new tab|Out of stock|In stock|Read more|View related links)\b.*$",
                "", t, flags=re.IGNORECASE)
     t = re.sub(r"\s*\d\.\d\s*\(\d[\d,]*\).*$", "", t)  # trailing rating like 4.7(20)
-    t = re.sub(r"\s*[·|].*$", "", t)                    # leftover separators
-    return t.strip(" -–—|·.")
+    t = _EMBEDDED_URL.sub("", t)                        # breadcrumb URL tail
+    t = re.sub(r"\s*[·|›»].*$", "", t)                  # leftover separators
+    return t.strip(" -–—|·›».")
 
 
 def _is_junk_title(t: str) -> bool:
@@ -232,11 +273,36 @@ def _is_junk_title(t: str) -> bool:
     return low in _JUNK_EXACT or any(j in low for j in _JUNK_CONTAINS)
 
 
+def _is_domain_only(t: str) -> bool:
+    """True when a cleaned title is nothing but a merchant host ("Amazon.com").
+
+    Only ``_to_titles`` screens on this. It's useless as a *product name* and
+    used to pollute the frequency ranking (enough same-merchant tiles and a bare
+    domain outranks the real product), but the anchor it came from is still a
+    genuine merchant link, so ``_to_matches`` keeps it -- the parser favours
+    recall, and ``Match`` carries the URL that actually matters.
+    """
+    return bool(_BARE_DOMAIN.match(t.strip()))
+
+
 def _download_image(url: str) -> bytes | None:
-    """Fetch an image URL so callers can pass links straight to search()."""
+    """Fetch an image URL so callers can pass links straight to search().
+
+    A soft-404 (a host answering 200 with an HTML "not found" page) is rejected
+    here rather than uploaded to Lens as a JPEG: Google dutifully finds nothing
+    in it, and the caller gets a bare "no results" for what is really a dead
+    link. Only an unmistakably non-image body is refused -- plenty of CDNs serve
+    real images as ``application/octet-stream`` or with no type at all.
+    """
     try:
         resp = requests.get(url, timeout=30, headers={"User-Agent": _REQ_UA_FALLBACK})
         resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        if content_type.startswith("text/") or content_type in {
+            "application/json", "application/xhtml+xml", "application/xml",
+        }:
+            logger.warning("glens: %s served %s, not an image; ignoring it.", url, content_type)
+            return None
         return resp.content or None
     except requests.RequestException as exc:
         logger.warning("glens: could not download image %s (%s)", url, exc)
@@ -309,16 +375,25 @@ def _save_cookie_jar(driver, cookie_file: Path) -> None:
         cookies = [
             {k: c.get(k) for k in ("name", "value", "domain", "path") if c.get(k) is not None}
             for c in driver.get_cookies()
-            if "google" in (c.get("domain") or "")
+            # Match on LABEL boundaries, exactly as link classification does. A
+            # substring scan for "google" also swept up cookies belonging to
+            # unrelated hosts that merely contain the word ("notgoogle.com",
+            # "google.com.example.net") and wrote them into our jar.
+            if _is_google_host(c.get("domain") or "")
         ]
         if not cookies:
             return
         ua = driver.execute_script("return navigator.userAgent") or _REQ_UA_FALLBACK
         cookie_file.parent.mkdir(parents=True, exist_ok=True)
-        cookie_file.write_text(
+        # Write-then-rename: a crash or a full disk mid-write would otherwise
+        # truncate the jar in place, and a half-written jar is unloadable --
+        # taking out the working fast path this run was only meant to refresh.
+        tmp = cookie_file.with_name(f"{cookie_file.name}.{os.getpid()}.tmp")
+        tmp.write_text(
             json.dumps({"user_agent": ua, "cookies": cookies, "minted_at": time.time()}),
             encoding="utf-8",
         )
+        tmp.replace(cookie_file)
         logger.info("glens: saved %d google.com cookie(s) for the req backend.", len(cookies))
     except Exception as exc:
         logger.info("glens: could not save the cookie jar (%s).", exc)
@@ -788,7 +863,8 @@ def _to_titles(items: list[dict], max_titles: int) -> list[str]:
         if not _is_external(item.get("href", "")):
             continue
         title = _clean_title(item.get("text", ""))
-        if 8 <= len(title) <= 100 and not _is_junk_title(title):
+        if (8 <= len(title) <= 100 and not _is_junk_title(title)
+                and not _is_domain_only(title)):
             cleaned.append(title)
     return [title for title, _ in Counter(cleaned).most_common(max_titles)]
 
