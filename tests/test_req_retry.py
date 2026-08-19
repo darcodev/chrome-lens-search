@@ -176,3 +176,30 @@ def test_chrome_headers_skip_ua_hints_for_non_chrome_ua():
     headers = lens_mod._req_session(jar).headers
     assert "sec-ch-ua" not in headers
     assert headers["Referer"] == "https://www.google.com/"
+
+
+def test_upload_that_never_redirects_falls_back(monkeypatch, jar_file):
+    """resp.url still on the upload endpoint means the POST never redirected.
+
+    The endpoint lives on lens.google.com, so the old "lens" substring check
+    waved it through and the upload response body got parsed as a results page.
+    """
+    session = FlakySession(fail_first=0, url=lens_mod._UPLOAD_ENDPOINT,
+                           html=SYNTHETIC_RESULTS_HTML)
+    monkeypatch.setattr(lens_mod, "_req_session", lambda jar, lang=None: session)
+
+    items, url = lens_mod._search_via_requests(b"img", jar_file)
+
+    assert session.posts == 1
+    assert items is None and url is None
+
+
+def test_consent_interstitial_falls_back(monkeypatch, jar_file):
+    # Carries "lens" in its continue= param, so it used to read as a results page.
+    consent = "https://consent.google.com/m?continue=https://lens.google.com/search"
+    session = FlakySession(fail_first=0, url=consent, html=SYNTHETIC_RESULTS_HTML)
+    monkeypatch.setattr(lens_mod, "_req_session", lambda jar, lang=None: session)
+
+    items, url = lens_mod._search_via_requests(b"img", jar_file)
+
+    assert items is None and url is None

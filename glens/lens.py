@@ -253,6 +253,43 @@ def _domain_of(href: str) -> str:
         return ""
 
 
+# Path of the upload endpoint, so a POST that never redirected can be told from
+# the results page it was supposed to land on.
+_UPLOAD_PATH = urlparse(_UPLOAD_ENDPOINT).path.rstrip("/")
+
+
+def _looks_like_results_url(url: str) -> bool:
+    """True when a URL is the Lens results page both backends are waiting for.
+
+    The single place that answers "did the upload land?", judged by HOST and
+    PATH rather than by scanning the whole URL for "lens". A bare substring scan
+    got this wrong in both directions:
+
+      * the upload endpoint is itself on ``lens.google.com``, so an upload that
+        never redirected read as a results page -- and the req backend went on to
+        parse the upload response body as if it were results;
+      * a consent/sorry interstitial carries the real target in a query param
+        (``consent.google.com/m?continue=https://lens.google.com/...``), so it
+        matched too, ending the browser's address-bar poll on the wrong hop.
+    """
+    if not url or "://" not in url:
+        return False
+    try:
+        parts = urlparse(url)
+    except Exception:
+        return False
+    host = (parts.hostname or "").lower().removeprefix("www.")
+    if not _is_google_host(host):
+        return False
+    # Interstitials are hops, not the destination.
+    if host.startswith("consent.") or parts.path.startswith("/sorry"):
+        return False
+    if "udm=26" in (parts.query or ""):
+        return True
+    # A lens.google.com results page -- but not the endpoint we just posted to.
+    return host == "lens.google.com" and parts.path.rstrip("/") != _UPLOAD_PATH
+
+
 def _clean_title(text: str) -> str:
     t = re.sub(r"\s+", " ", text or "").strip()
     for sep in (" | ", " – ", " — "):  # merchant usually follows; keep the product part
@@ -354,23 +391,44 @@ def _cache_read(key: str, ttl: int) -> tuple[list[dict], str | None] | None:
 
 
 def _cache_write(key: str, items: list[dict], results_url: str | None) -> None:
+    tmp: Path | None = None
     try:
         cache_dir = _default_cache_dir()
         cache_dir.mkdir(parents=True, exist_ok=True)
         # Write-then-rename so concurrent writers can't leave a torn entry.
-        tmp = cache_dir / f"{key}.{os.getpid()}.tmp"
+        # pid AND thread id: _cache_write runs outside _lens_lock, so two threads
+        # looking up the same image+lang shared one tmp path and could rename a
+        # half-written file into place.
+        tmp = cache_dir / f"{key}.{os.getpid()}.{threading.get_ident()}.tmp"
         tmp.write_text(
             json.dumps({"saved_at": time.time(), "results_url": results_url, "items": items}),
             encoding="utf-8",
         )
         tmp.replace(cache_dir / f"{key}.json")
+        tmp = None
     except Exception as exc:
         logger.info("glens: could not write the result cache (%s)", exc)
+    finally:
+        # A failed rename must not strand the temp file. On Windows the rename
+        # genuinely loses races (two threads publishing the same key), and the
+        # cache is never swept, so every loss used to leak a file forever.
+        _discard(tmp)
+
+
+def _discard(path: Path | None) -> None:
+    """Best-effort unlink of a temp file we failed to publish."""
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _save_cookie_jar(driver, cookie_file: Path) -> None:
     """Persist the browser's google.com cookies + UA so the req backend can reuse
     the JS-verified session. Best-effort; called after every successful browser run."""
+    tmp: Path | None = None
     try:
         cookies = [
             {k: c.get(k) for k in ("name", "value", "domain", "path") if c.get(k) is not None}
@@ -397,6 +455,7 @@ def _save_cookie_jar(driver, cookie_file: Path) -> None:
         logger.info("glens: saved %d google.com cookie(s) for the req backend.", len(cookies))
     except Exception as exc:
         logger.info("glens: could not save the cookie jar (%s).", exc)
+        _discard(tmp)
 
 
 def _load_cookie_jar(cookie_file: Path) -> dict | None:
@@ -511,8 +570,12 @@ def _parse_anchors_from_html(html: str) -> list[dict]:
         href = _unwrap_google_redirect(
             urljoin("https://www.google.com/", unescape(href_match.group(1)))
         )
+        # An EMPTY aria-label is not a label -- fall back to the anchor's own
+        # text, exactly as the browser harvest does (JS treats "" as falsy).
+        # Google emits blank aria-labels on image-wrapper tiles, and taking them
+        # literally dropped those matches outright.
         aria = _HTML_ARIA_RE.search(attrs)
-        text = aria.group(1) if aria else re.sub(r"<[^>]+>", " ", inner)
+        text = (aria.group(1) if aria else "").strip() or re.sub(r"<[^>]+>", " ", inner)
         text = re.sub(r"\s+", " ", unescape(text)).strip()
         items.append({"href": href, "text": text})
     return items
@@ -535,6 +598,9 @@ def _search_via_requests(
         return None, None
     session = _req_session(jar, lang=lang)
     last_exc: Exception | None = None
+    # Bound before the loop: the HTTPError handler reports it, and the upload
+    # itself can fail before we ever learn where it would have landed.
+    results_url: str | None = None
     for attempt in range(1, _REQ_ATTEMPTS + 1):
         if attempt > 1:
             time.sleep(_REQ_BACKOFF_SECONDS)
@@ -548,7 +614,7 @@ def _search_via_requests(
             )
             resp.raise_for_status()
             results_url = resp.url or ""
-            if "udm=26" not in results_url and "lens" not in results_url:
+            if not _looks_like_results_url(results_url):
                 logger.info("glens req upload didn't yield a results URL (%s); falling back.",
                             results_url[:120])
                 return None, None
@@ -583,7 +649,7 @@ def _search_via_requests(
             # re-uploads the image to an endpoint that just refused it. Fall back
             # now so the browser can re-mint the jar.
             logger.info("glens req backend: HTTP error (%s); falling back to the browser.", exc)
-            return None, None
+            return None, results_url
         except requests.RequestException as exc:
             last_exc = exc
             logger.info("glens req backend attempt %d/%d failed (%s).",
@@ -669,7 +735,7 @@ def _upload_to_google(driver, frame_bytes: bytes, result_timeout: int,
             current = ""
         if current and current != before and not current.startswith(endpoint):
             settled = current
-            if "udm=26" in current or "lens" in current:
+            if _looks_like_results_url(current):
                 break
         time.sleep(0.5)
     if not settled:
@@ -721,10 +787,21 @@ def _render_and_harvest(driver, results_url: str, result_timeout: int, wait_read
         try:
             return drv.execute_script(
                 r"""
+                // Match Google's hosts on LABEL boundaries, as _is_google_host
+                // does. Scanning for the literal "google.com" missed every other
+                // Google domain (google.de, google.co.uk, gstatic), so on a
+                // non-.com locale the page's own nav/footer links counted as
+                // products: the wait was satisfied instantly and we harvested
+                // before a single tile had rendered.
+                const GOOGLE = /(^|\.)(google|gstatic)(\.[a-z]{2,3}){1,2}$/;
+                const isGoogle = h =>
+                    GOOGLE.test(h) || h === 'google' || h.endsWith('.google');
                 return Array.from(document.querySelectorAll('a[href]')).filter(a => {
                     const h = a.href || '';
                     if (!h.includes('://')) return false;
-                    if (!h.includes('google.com')) return true;
+                    let host = '';
+                    try { host = new URL(h).hostname.toLowerCase(); } catch (e) { return false; }
+                    if (!isGoogle(host)) return true;
                     return h.includes('/url?')
                            && (h.includes('q=http') || h.includes('url=http'));
                 }).length;

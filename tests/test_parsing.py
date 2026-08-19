@@ -142,3 +142,31 @@ def test_browser_harvest_survives_a_dead_driver():
 def test_browser_harvest_tolerates_missing_hrefs():
     assert _harvest_anchors(_FakeDriver([{"text": "no href key"}])) == [{"href": "",
                                                                         "text": "no href key"}]
+
+
+# A blank aria-label is not a label. Google emits them on image-wrapper tiles,
+# and taking them literally used to drop the anchor's own text -- and with it
+# the match -- while the browser harvest (JS: "" is falsy) kept it.
+BLANK_ARIA_HTML = """
+<html><body>
+  <a href="https://merchant.example/killshot" aria-label="">Acme Killshot 2 Leather</a>
+  <a href="https://other.example/samba" aria-label="   ">Acme Samba OG Shoe</a>
+  <a href="https://third.example/gel" aria-label="Acme Gel Trail Runner">ignored inner</a>
+</body></html>
+"""
+
+
+def test_blank_aria_label_falls_back_to_the_anchor_text():
+    items = _parse_anchors_from_html(BLANK_ARIA_HTML)
+    assert [i["text"] for i in items] == [
+        "Acme Killshot 2 Leather",       # aria-label="" -> inner text
+        "Acme Samba OG Shoe",            # whitespace-only aria-label -> inner text
+        "Acme Gel Trail Runner",         # a real aria-label still wins
+    ]
+
+
+def test_blank_aria_label_anchors_still_become_matches():
+    matches = _to_matches(_parse_anchors_from_html(BLANK_ARIA_HTML), 10)
+    assert [m.domain for m in matches] == [
+        "merchant.example", "other.example", "third.example",
+    ]

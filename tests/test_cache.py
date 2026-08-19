@@ -163,3 +163,35 @@ def test_shaping_applies_to_cached_items(monkeypatch, tmp_path, cache_dir):
     capped = _search(monkeypatch, tmp_path, explode, use_cache=True, max_matches=1)
     assert capped is not None
     assert len(capped.matches) == 1            # per-call shaping, not baked in
+
+
+def test_concurrent_writers_get_distinct_tmp_paths(monkeypatch, tmp_path, cache_dir):
+    """_cache_write runs OUTSIDE _lens_lock, so two threads looking up the same
+    image+lang reach it at once. A tmp name keyed only on the pid gave them one
+    shared path, and a rename could publish a half-written entry."""
+    import threading
+
+    key = _cache_key(b"synthetic-image", None)
+    seen: list[str] = []
+    real_write_text = lens_mod.Path.write_text
+
+    def spy(self, *args, **kwargs):
+        if self.name.endswith(".tmp"):
+            seen.append(self.name)
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(lens_mod.Path, "write_text", spy)
+
+    threads = [threading.Thread(target=lens_mod._cache_write,
+                                args=(key, SYNTHETIC_ITEMS, RESULTS_URL))
+               for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(seen) == 4
+    assert len(set(seen)) == 4, f"tmp paths collided: {seen}"
+    # The published entry is still intact, and no residue is left behind.
+    assert json.loads((cache_dir / f"{key}.json").read_text())["items"] == SYNTHETIC_ITEMS
+    assert not list(cache_dir.glob("*.tmp"))
