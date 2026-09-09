@@ -23,6 +23,11 @@ Two backends (``backend=`` / ``GLENS_BACKEND``, default "auto"):
            saves the google.com cookies + UA back to the jar so req can reuse them.
   auto     req first, browser as a fallback. This is the default.
 
+Result tiles link out through Google's own redirect wrapper
+(``google.com/goto?url=<blob>``). The blob is encrypted, so the merchant URL is
+nowhere in the page; we resolve each wrapper with one cheap request that reads
+the ``Location`` header and stops, never touching the merchant's own site.
+
 The parser stays selector-light on purpose. Lens markup uses randomized, rotating
 class names, so instead of hardcoding classes we just grab every anchor and mine
 its href and label. That's high-recall and a little noisy; filter it downstream
@@ -43,6 +48,7 @@ import threading
 import time
 import zlib
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from html import unescape
 from pathlib import Path
@@ -224,17 +230,74 @@ def _is_google_host(host: str) -> bool:
 
 
 def _is_external(href: str) -> bool:
-    """True for a real off-Google link. Judge by the HOST only: a merchant URL
-    that merely carries a Google token in its path or query (an affiliate tag
-    like ``?utm_source=google.com``, a ``&url=`` redirect target, a ``ved``
-    param) is still external and must not be dropped."""
+    """True for a link that leaves Google.
+
+    Judged by the HOST, with one deliberate exception. A merchant URL that
+    merely carries a Google token in its path or query (an affiliate tag like
+    ``?utm_source=google.com``, a ``ved`` param) is external and must not be
+    dropped. But Google's own outbound *wrapper* is external too: the host is
+    google.com while the link itself goes to a merchant, and treating it as
+    Google's own drops every product tile on the page (see
+    ``_is_google_redirect``).
+    """
     h = (href or "").lower()
     if "://" not in h:
         return False
     host = _domain_of(h)  # hostname, lowercased, leading 'www.' stripped
     if not host:
         return False
-    return not _is_google_host(host)
+    if not _is_google_host(host):
+        return True
+    return _is_google_redirect(href)
+
+
+# Paths of Google's outbound link wrappers. ``/url`` is the classic one and
+# carries its target in the clear; ``/goto`` is what Lens result tiles use now
+# and carries an ENCRYPTED blob instead (verified live 2026-09).
+_REDIRECT_PATHS = frozenset({"/goto", "/url"})
+# Resolving a wrapper is one cheap 302 lookup each, so fan them out.
+_RESOLVE_WORKERS = 8
+_RESOLVE_TIMEOUT = 15
+
+
+def _is_google_redirect(href: str) -> bool:
+    """True when a URL is Google's own wrapper around an outbound link.
+
+    Recognised by host AND path AND the presence of a target parameter, so a
+    Google page that merely has ``url=`` in its query (or a merchant with its
+    own ``/goto`` route) isn't mistaken for one.
+    """
+    if "://" not in (href or ""):
+        return False
+    try:
+        parts = urlparse(href)
+    except Exception:
+        return False
+    host = (parts.hostname or "").lower().removeprefix("www.")
+    if not _is_google_host(host):
+        return False
+    if parts.path.rstrip("/") not in _REDIRECT_PATHS:
+        return False
+    try:
+        params = parse_qs(parts.query)
+    except Exception:
+        return False
+    return bool(params.get("url") or params.get("q"))
+
+
+def _redirect_target(href: str) -> str | None:
+    """The plain URL inside a wrapper, when it carries one.
+
+    ``/url?q=https://merchant...`` hands the target over in the clear, so it
+    costs nothing to unwrap. ``/goto?url=<blob>`` doesn't -- the blob is
+    encrypted, and only ``_resolve_google_redirects`` can turn it into a URL.
+    """
+    try:
+        params = parse_qs(urlparse(href).query)
+    except Exception:
+        return None
+    target = (params.get("q") or params.get("url") or [""])[0]
+    return target if target.startswith(("http://", "https://")) else None
 
 
 def _domain_of(href: str) -> str:
@@ -290,13 +353,56 @@ def _looks_like_results_url(url: str) -> bool:
     return host == "lens.google.com" and parts.path.rstrip("/") != _UPLOAD_PATH
 
 
-def _clean_title(text: str) -> str:
+# How many leading words to consider when matching a merchant's display name
+# against its domain ("Sneaker Politics" -> sneakerpolitics.com).
+_MERCHANT_PREFIX_WORDS = 4
+
+
+def _strip_merchant_prefix(title: str, domain: str) -> str:
+    """Drop the merchant's display name from the front of a Lens label.
+
+    Lens prefixes every tile label with the seller. It used to use the bare
+    HOST ("thepremierstore.com (+1) - Killshot 2"), which ``_DOMAIN_PREFIX``
+    strips; it now uses the display NAME instead ("Foot Locker Nike Dunk Low
+    Retro - Men's"), which no pattern can recognise on its own -- "Foot Locker"
+    is indistinguishable from a product's opening words.
+
+    The domain we resolved the link to settles it: strip the leading words only
+    when they spell out that domain ("Foot Locker" -> footlocker.com, "Macy's"
+    -> macys.com). A merchant whose name doesn't match its domain (si.com for
+    "Sports Illustrated") simply keeps the prefix, as before.
+
+    This is what restores the frequency ranking. With the seller baked into
+    every label, each tile for the same shoe cleaned to a *different* string, so
+    the exact match no longer repeated and could not rise to the top.
+    """
+    if not domain or not title:
+        return title
+    flat = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())  # noqa: E731
+    targets = {flat(domain), flat(domain.split(".")[0])} - {""}
+    if not targets:
+        return title
+    words = title.split()
+    seen = ""
+    for count in range(1, min(len(words), _MERCHANT_PREFIX_WORDS) + 1):
+        seen += flat(words[count - 1])
+        if seen in targets:
+            # Never let the merchant's name eat the whole label: a tile whose
+            # title really is just the seller keeps it (_is_domain_only screens
+            # those out of the ranking downstream).
+            rest = " ".join(words[count:]).strip(" -–—:|·")
+            return rest or title
+    return title
+
+
+def _clean_title(text: str, domain: str = "") -> str:
     t = re.sub(r"\s+", " ", text or "").strip()
     for sep in (" | ", " – ", " — "):  # merchant usually follows; keep the product part
         if sep in t:
             t = t.split(sep)[0].strip()
     t = _MARKETPLACE_PREFIX.sub("", t)
     t = _DOMAIN_PREFIX.sub("", t)
+    t = _strip_merchant_prefix(t, domain)
     t = re.sub(r"\b(Opens in new tab|Out of stock|In stock|Read more|View related links)\b.*$",
                "", t, flags=re.IGNORECASE)
     t = re.sub(r"\s*\d\.\d\s*\(\d[\d,]*\).*$", "", t)  # trailing rating like 4.7(20)
@@ -539,23 +645,71 @@ _HTML_ARIA_RE = re.compile(r"""aria-label\s*=\s*["']([^"']*)["']""", re.IGNORECA
 
 
 def _unwrap_google_redirect(href: str) -> str:
-    """``google.com/url?q=<target>`` -> ``<target>``.
+    """``google.com/url?q=<target>`` -> ``<target>``, when the target is in the clear.
 
-    Google wraps merchant links this way in the raw HTML *and* in the rendered
-    DOM, so both harvests run hrefs through here. Only Google's own wrapper is
-    unwrapped — ``_is_external`` is false for exactly the Google hosts — so a
-    merchant that happens to have its own ``/url?q=`` route keeps its link.
+    Google wraps merchant links in the raw HTML *and* in the rendered DOM, so
+    both harvests run hrefs through here. Only Google's own wrapper is unwrapped
+    (``_is_google_redirect`` checks the host), so a merchant that happens to have
+    its own ``/url?q=`` route keeps its link. An encrypted ``/goto`` wrapper
+    comes back unchanged for ``_resolve_google_redirects`` to deal with.
     """
-    if "/url?" not in href or _is_external(href):
+    if not _is_google_redirect(href):
         return href
+    return _redirect_target(href) or href
+
+
+def _resolve_google_redirects(items: list[dict]) -> None:
+    """Rewrite Google's encrypted outbound wrappers to the URLs they point at.
+
+    Google used to hand out ``google.com/url?q=<merchant url>``, which unwraps
+    offline. Lens result tiles now use ``google.com/goto?url=<blob>``, where the
+    blob is encrypted and the merchant URL appears nowhere in the page — not in
+    the href, not in the ``ping`` attribute. Asking is the only way to learn it:
+    the wrapper answers ``302`` with the merchant URL in ``Location``. We read
+    that header and stop, so the merchant's own site is never contacted.
+
+    Needs no cookies, so it serves both backends. Best-effort and in place: an
+    anchor we can't resolve keeps its wrapper URL, which still works when
+    clicked, and ``_is_external`` already counts it as a result either way.
+    """
+    pending: dict[str, list[dict]] = {}
+    for item in items:
+        href = item.get("href") or ""
+        # Only the encrypted ones need the network; /url?q= already unwrapped.
+        if _is_google_redirect(href) and not _redirect_target(href):
+            pending.setdefault(href, []).append(item)
+    if not pending:
+        return
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": _REQ_UA_FALLBACK})
+
+    def resolve(href: str) -> tuple[str, str]:
+        try:
+            resp = session.get(href, timeout=_RESOLVE_TIMEOUT, allow_redirects=False)
+            target = resp.headers.get("Location", "")
+            return href, target if target.startswith(("http://", "https://")) else ""
+        except requests.RequestException:
+            return href, ""
+
     try:
-        params = parse_qs(urlparse(href).query)
-        target = (params.get("q") or params.get("url") or [""])[0]
-        if target.startswith("http"):
-            return target
-    except Exception:
-        pass
-    return href
+        with ThreadPoolExecutor(max_workers=min(_RESOLVE_WORKERS, len(pending))) as pool:
+            resolved = dict(pool.map(resolve, pending))
+    except Exception as exc:
+        logger.info("glens: could not resolve Google's link wrappers (%s).", exc)
+        return
+    finally:
+        session.close()
+
+    done = 0
+    for href, anchors in pending.items():
+        target = resolved.get(href) or ""
+        if not target:
+            continue
+        for item in anchors:
+            item["href"] = target
+        done += 1
+    logger.info("glens: resolved %d/%d Google link wrapper(s).", done, len(pending))
 
 
 def _parse_anchors_from_html(html: str) -> list[dict]:
@@ -750,10 +904,27 @@ def _harvest_anchors(driver) -> list[dict]:
         items = driver.execute_script(
             r"""
             const norm = s => (s||'').replace(/\s+/g,' ').trim();
+            // Join the anchor's text nodes with a SPACE. This mirrors the
+            // raw-HTML harvest's tag -> " " substitution, so both backends hand
+            // the same text downstream. Neither DOM shortcut does that job:
+            // innerText reports only what's *rendered*, and Lens tiles clip
+            // theirs ("for from Nike" instead of the product name), while
+            // textContent runs adjacent elements together with nothing between
+            // them ("Foot LockerNike Dunk Low Retro").
+            const spacedText = el => {
+                const parts = [];
+                const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+                while (walk.nextNode()) parts.push(walk.currentNode.nodeValue);
+                return parts.join(' ');
+            };
+            // norm() before each fallback: a whitespace-only label is not a
+            // label, and taking it literally shadowed the img alt behind it.
+            const label = a => norm(a.getAttribute('aria-label'))
+                            || norm(spacedText(a))
+                            || norm((a.querySelector('img')||{}).alt);
             return Array.from(document.querySelectorAll('a[href]')).map(a => ({
                 href: a.href || '',
-                text: norm(a.getAttribute('aria-label') || a.innerText
-                           || (a.querySelector('img')||{}).alt)
+                text: label(a)
             })).filter(x => x.href);
             """
         )
@@ -802,8 +973,16 @@ def _render_and_harvest(driver, results_url: str, result_timeout: int, wait_read
                     let host = '';
                     try { host = new URL(h).hostname.toLowerCase(); } catch (e) { return false; }
                     if (!isGoogle(host)) return true;
-                    return h.includes('/url?')
-                           && (h.includes('q=http') || h.includes('url=http'));
+                    // Google's outbound wrappers are products too. /goto carries
+                    // an ENCRYPTED target, so testing for "url=http" (the old
+                    // /url?q= shape) matched none of them: on a page where every
+                    // tile is wrapped the wait was never satisfied and we burned
+                    // the whole timeout before harvesting.
+                    let path = '';
+                    try { path = new URL(h).pathname.replace(/\/+$/, ''); }
+                    catch (e) { return false; }
+                    if (path !== '/goto' && path !== '/url') return false;
+                    return /[?&](url|q)=./.test(h);
                 }).length;
                 """
             ) > 5
@@ -920,10 +1099,14 @@ def _to_matches(items: list[dict], max_matches: int) -> list[Match]:
         href = item.get("href", "")
         if not _is_external(href):
             continue
-        title = _clean_title(item.get("text", ""))
+        # A wrapper we couldn't resolve is still a working link, but its host is
+        # google.com and reporting that as the merchant would be a lie.
+        domain = "" if _is_google_redirect(href) else _domain_of(href)
+        title = _clean_title(item.get("text", ""), domain)
         if not title or _is_junk_title(title):
             continue
-        domain = _domain_of(href)
+        # A wrapper we couldn't resolve is still a working link, but its host is
+        # google.com and reporting that as the merchant would be a lie.
         key = (domain, title.lower())
         if key in seen:
             continue
@@ -937,9 +1120,11 @@ def _to_titles(items: list[dict], max_titles: int) -> list[str]:
     rises to the top; ties keep Google's relevance order)."""
     cleaned = []
     for item in items:
-        if not _is_external(item.get("href", "")):
+        href = item.get("href", "")
+        if not _is_external(href):
             continue
-        title = _clean_title(item.get("text", ""))
+        title = _clean_title(item.get("text", ""),
+                             "" if _is_google_redirect(href) else _domain_of(href))
         if (8 <= len(title) <= 100 and not _is_junk_title(title)
                 and not _is_domain_only(title)):
             cleaned.append(title)
@@ -1029,8 +1214,12 @@ def search(
             if items is None and backend in ("auto", "browser"):
                 items, results_url = _search_via_browser(frame_bytes, cookie_path, timeout,
                                                          driver_factory)
-        if items and cache_key:
-            _cache_write(cache_key, items, results_url)
+        if items:
+            # Before caching: the cache must hold real merchant URLs, never the
+            # short-lived encrypted wrappers they arrived as.
+            _resolve_google_redirects(items)
+            if cache_key:
+                _cache_write(cache_key, items, results_url)
 
     if not items:
         return None

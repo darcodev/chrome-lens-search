@@ -58,15 +58,25 @@ def test_is_external_keeps_hosts_that_merely_contain_a_google_name(href):
 
 
 @pytest.mark.parametrize("href", [
-    "https://www.google.com:443/url?q=https://shop.example/x",
+    "https://www.google.com:443/preferences?hl=en",
     "https://google.com:443/search?q=x",
     "https://lens.google.com:8443/uploadbyurl",
 ])
 def test_is_external_excludes_google_hosts_carrying_a_port(href):
     # The host check anchors on the end of the name, so a port kept in the host
-    # ("google.com:443") slipped past it. Google's own link then counted as a
-    # merchant match, and its /url?q= wrapper never got unwrapped.
+    # ("google.com:443") slipped past it, and Google's own link counted as a
+    # merchant match.
     assert _is_external(href) is False
+
+
+@pytest.mark.parametrize("href", [
+    "https://www.google.com:443/url?q=https://shop.example/x",
+    "https://www.google.com:8443/goto?url=CAESoAEB6zsw",
+])
+def test_is_external_keeps_wrapped_links_carrying_a_port(href):
+    # A port must not defeat wrapper detection either: these leave Google, and
+    # dropping them as "Google's own" is what emptied every result page.
+    assert _is_external(href) is True
 
 
 @pytest.mark.parametrize(("href", "expected"), [

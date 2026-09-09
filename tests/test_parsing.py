@@ -108,10 +108,10 @@ WRAPPED_TILE = "https://www.google.com/url?q=https://shop.example/p/1&sa=U&ved=a
 
 
 def test_browser_harvest_unwraps_google_wrappers():
-    # The rendered DOM carries the same wrappers the raw HTML does. Left wrapped,
-    # every tile is judged by google.com's host and thrown away as internal --
-    # the browser pass would report zero matches on a page full of products.
-    assert not _is_external(WRAPPED_TILE)
+    # The rendered DOM carries the same wrappers the raw HTML does. A wrapper is
+    # an outbound link, so it counts as external -- but it still has to be
+    # unwrapped, or Match.domain reports google.com as the merchant.
+    assert _is_external(WRAPPED_TILE)
 
     items = _harvest_anchors(_FakeDriver(
         [{"href": WRAPPED_TILE, "text": "Acme Widget Pro Runner"},

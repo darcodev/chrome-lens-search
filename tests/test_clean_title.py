@@ -113,3 +113,71 @@ def test_is_junk_title_true(junk):
 )
 def test_is_junk_title_false(real):
     assert not _is_junk_title(real)
+
+
+# ---------------------------------------------------------------------------
+# Merchant display-name prefixes.
+#
+# Lens used to prefix a tile label with the seller's HOST ("shop.example (+1) -
+# Acme Widget"), which _DOMAIN_PREFIX strips. It now uses the display NAME
+# ("Sneaker Politics Acme Widget"), which nothing can recognise from the text
+# alone -- so the domain the link resolved to is what settles it.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("raw", "domain", "expected"),
+    [
+        # Multi-word names that spell out the domain.
+        ("Sneaker Politics Acme Widget Pro", "sneakerpolitics.com", "Acme Widget Pro"),
+        ("Foot Locker Acme Widget Pro", "footlocker.com", "Acme Widget Pro"),
+        # Punctuation in the name is ignored on both sides.
+        ("Macy's Acme Widget Pro", "macys.com", "Acme Widget Pro"),
+        ("Sneakers.com Acme Widget Pro", "sneakers.com", "Acme Widget Pro"),
+        # Case and country TLDs don't matter.
+        ("DTLR Acme Widget Pro", "dtlr.com", "Acme Widget Pro"),
+        ("Acme Buy Acme Widget Pro", "acme.sa", "Buy Acme Widget Pro"),
+        # A dash or colon left behind by the prefix goes with it.
+        ("Feature - Acme Widget Pro", "feature.com", "Acme Widget Pro"),
+        # A brand selling on its own site: one copy of the name is the seller,
+        # the other belongs to the product.
+        ("Acme Acme Widget Pro", "acme.com", "Acme Widget Pro"),
+    ],
+)
+def test_clean_title_strips_the_merchant_display_name(raw, domain, expected):
+    assert _clean_title(raw, domain) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "domain"),
+    [
+        # The name doesn't spell out the domain, so we can't be sure it IS the
+        # name -- leave it alone rather than eat a real word off the product.
+        ("Sports Illustrated Acme Widget Pro", "si.com"),
+        ("Premier Acme Widget Pro", "thepremierstore.com"),
+        # A product whose opening words merely resemble a merchant.
+        ("Acme Widget Pro", "shop.example"),
+        # No domain (an unresolved wrapper) means no signal to strip on.
+        ("Foot Locker Acme Widget Pro", ""),
+    ],
+)
+def test_clean_title_keeps_a_prefix_it_cannot_confirm(raw, domain):
+    assert _clean_title(raw, domain) == _clean_title(raw)
+
+
+def test_clean_title_never_strips_a_label_down_to_nothing():
+    # The tile's whole label is the seller. Keep it: _is_domain_only and the
+    # junk filters decide what to do with it downstream.
+    assert _clean_title("Foot Locker", "footlocker.com") == "Foot Locker"
+
+
+def test_stripping_the_seller_restores_the_frequency_ranking():
+    # The point of the whole exercise. With the seller baked into every label,
+    # each tile for the same shoe cleaned to a different string, every count
+    # was 1, and the exact match could not rise to the top.
+    items = [
+        {"href": "https://footlocker.example/p/1", "text": "Foot Locker Acme Widget Pro"},
+        {"href": "https://champssports.example/p/2", "text": "Champs Sports Acme Widget Pro"},
+        {"href": "https://shop.example/p/3", "text": "Some Other Gadget Deluxe"},
+    ]
+    assert _to_titles(items, 6)[0] == "Acme Widget Pro"
+    assert [m.title for m in _to_matches(items, 20)][:2] == ["Acme Widget Pro"] * 2
