@@ -131,6 +131,25 @@ def test_warmup_command_requires_browser_extra(capsys):
     assert "chrome-lens-search[browser]" in capsys.readouterr().err
 
 
+def test_warmup_command_reuses_valid_jar_without_browser_extra(tmp_path, monkeypatch, capsys):
+    jar = _write_valid_jar(tmp_path / "jar.json")
+
+    def no_browser(*args, **kwargs):
+        raise AssertionError("an existing jar must not need the browser backend")
+
+    monkeypatch.setattr(cli, "warmup", no_browser)
+    assert cli.main(["warmup", "--cookie-file", str(jar)]) == 0
+    err = capsys.readouterr().err
+    assert "Session jar ready" in err
+    assert "launching Chrome" not in err
+
+
+def test_forced_warmup_still_requires_browser_extra(tmp_path, capsys):
+    jar = _write_valid_jar(tmp_path / "jar.json")
+    assert cli.main(["warmup", "--cookie-file", str(jar), "--force"]) == 2
+    assert "chrome-lens-search[browser]" in capsys.readouterr().err
+
+
 def test_warmup_command_success(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_browser_extra_missing", lambda: False)
     seen = {}

@@ -166,6 +166,11 @@ def _cmd_warmup(argv: list[str]) -> int:
     if args.verbose:
         logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 
+    cookie_path = Path(args.cookie_file) if args.cookie_file else _default_cookie_file()
+    if not args.force and _load_cookie_jar(cookie_path) is not None:
+        print("Session jar ready. Lookups now run over plain HTTP.", file=sys.stderr)
+        return 0
+
     if _browser_extra_missing():
         print('glens: warmup needs the browser extra: '
               'pip install "chrome-lens-search[browser]"', file=sys.stderr)

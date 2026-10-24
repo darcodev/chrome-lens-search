@@ -99,6 +99,29 @@ def test_corrupt_entry_is_a_miss(monkeypatch, tmp_path, cache_dir):
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("invalid", [
+    {"items": "not a list"},
+    {"items": [None]},
+    {"items": [{"href": 123, "text": "Acme Trail Shoe"}]},
+    {"items": [{"href": "https://shop.example/p", "text": None}]},
+    {"saved_at": "NaN"},
+    {"saved_at": "Infinity"},
+    {"results_url": ["not a URL"]},
+])
+def test_malformed_cache_entry_falls_back_to_backend(monkeypatch, tmp_path, cache_dir, invalid):
+    cache_dir.mkdir()
+    data = {"saved_at": time.time(), "items": SYNTHETIC_ITEMS, "results_url": RESULTS_URL}
+    data.update(invalid)
+    entry = cache_dir / f"{_cache_key(b'synthetic-image', None)}.json"
+    entry.write_text(json.dumps(data), encoding="utf-8")
+    calls = []
+
+    result = _search(monkeypatch, tmp_path, _hit_backend(calls), use_cache=True)
+
+    assert result is not None and result.results_url == RESULTS_URL
+    assert calls == [1]
+
+
 def test_locale_keys_cache_separately(monkeypatch, tmp_path, cache_dir):
     calls = []
     _search(monkeypatch, tmp_path, _hit_backend(calls), use_cache=True, lang="de")

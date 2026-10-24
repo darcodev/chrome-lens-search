@@ -41,6 +41,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import re
 import struct
@@ -50,7 +51,7 @@ import zlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -485,13 +486,22 @@ def _cache_read(key: str, ttl: int) -> tuple[list[dict], str | None] | None:
         if not path.exists():
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
-        if time.time() - float(data.get("saved_at", 0)) > ttl:
+        saved_at = float(data.get("saved_at", 0))
+        if not math.isfinite(saved_at) or time.time() - saved_at > ttl:
             return None
         items = data.get("items")
-        if not items:
+        if not isinstance(items, list) or not items or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("href"), str)
+            or not isinstance(item.get("text"), str)
+            for item in items
+        ):
+            return None
+        results_url = data.get("results_url")
+        if results_url is not None and not isinstance(results_url, str):
             return None
         logger.info("glens: result cache hit (%s...)", key[:12])
-        return items, data.get("results_url")
+        return items, results_url
     except Exception:
         return None  # unreadable/corrupt cache entries are simply misses
 
@@ -569,7 +579,21 @@ def _load_cookie_jar(cookie_file: Path) -> dict | None:
         if not cookie_file.exists():
             return None
         jar = json.loads(cookie_file.read_text(encoding="utf-8"))
-        return jar if jar.get("cookies") else None
+        if not isinstance(jar, dict):
+            return None
+        cookies = jar.get("cookies")
+        if not isinstance(cookies, list) or not cookies or any(
+            not isinstance(cookie, dict)
+            or not isinstance(cookie.get("name"), str) or not cookie["name"]
+            or not isinstance(cookie.get("value"), str)
+            or any(cookie.get(key) is not None and not isinstance(cookie[key], str)
+                   for key in ("domain", "path"))
+            for cookie in cookies
+        ):
+            return None
+        if jar.get("user_agent") is not None and not isinstance(jar["user_agent"], str):
+            return None
+        return jar
     except Exception:
         return None
 
@@ -637,11 +661,6 @@ def _req_session(jar: dict, lang: str | None = None) -> requests.Session:
     if "SOCS" not in session.cookies:
         session.cookies.set("SOCS", "CAI", domain=".google.com", path="/")
     return session
-
-
-_HTML_ANCHOR_RE = re.compile(r"<a\b([^>]*)>(.*?)</a>", re.IGNORECASE | re.DOTALL)
-_HTML_HREF_RE = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
-_HTML_ARIA_RE = re.compile(r"""aria-label\s*=\s*["']([^"']*)["']""", re.IGNORECASE)
 
 
 def _unwrap_google_redirect(href: str) -> str:
@@ -712,27 +731,62 @@ def _resolve_google_redirects(items: list[dict]) -> None:
     logger.info("glens: resolved %d/%d Google link wrapper(s).", done, len(pending))
 
 
+class _AnchorParser(HTMLParser):
+    """Read actual HTML attributes and text nodes, with the browser's label fallbacks."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.items: list[dict] = []
+        self.anchor: dict | None = None
+        self.text: list[str] = []
+        self.alt: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._finish_anchor()
+            attributes = dict(attrs)
+            if attributes.get("href"):
+                self.anchor = attributes
+        elif tag == "img" and self.anchor is not None and self.alt is None:
+            self.alt = dict(attrs).get("alt") or ""
+
+    def handle_data(self, data):
+        if self.anchor is not None:
+            self.text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a":
+            self._finish_anchor()
+
+    def _finish_anchor(self):
+        if self.anchor is not None:
+            norm = lambda s: re.sub(r"\s+", " ", s or "").strip()  # noqa: E731
+            text = (norm(self.anchor.get("aria-label"))
+                    or norm(" ".join(self.text)) or norm(self.alt))
+            try:
+                href = _unwrap_google_redirect(
+                    urljoin("https://www.google.com/", self.anchor["href"])
+                )
+            except ValueError:
+                pass  # a malformed link must not discard the rest of the page
+            else:
+                self.items.append({"href": href, "text": text})
+        self.anchor = None
+        self.text = []
+        self.alt = None
+
+
 def _parse_anchors_from_html(html: str) -> list[dict]:
-    """Server-rendered results -> the same [{href, text}] shape the browser
-    harvest produces. Selector-light on purpose: anchors + aria-labels only."""
-    items: list[dict] = []
-    for match in _HTML_ANCHOR_RE.finditer(html):
-        attrs, inner = match.group(1), match.group(2)
-        href_match = _HTML_HREF_RE.search(attrs)
-        if not href_match:
-            continue
-        href = _unwrap_google_redirect(
-            urljoin("https://www.google.com/", unescape(href_match.group(1)))
-        )
-        # An EMPTY aria-label is not a label -- fall back to the anchor's own
-        # text, exactly as the browser harvest does (JS treats "" as falsy).
-        # Google emits blank aria-labels on image-wrapper tiles, and taking them
-        # literally dropped those matches outright.
-        aria = _HTML_ARIA_RE.search(attrs)
-        text = (aria.group(1) if aria else "").strip() or re.sub(r"<[^>]+>", " ", inner)
-        text = re.sub(r"\s+", " ", unescape(text)).strip()
-        items.append({"href": href, "text": text})
-    return items
+    """Server-rendered results -> the browser harvest's [{href, text}] shape.
+
+    HTMLParser handles quotes inside labels, unquoted attributes, entities and
+    comments without confusing data-href or JavaScript strings for real links.
+    """
+    parser = _AnchorParser()
+    parser.feed(html)
+    parser.close()
+    parser._finish_anchor()
+    return parser.items
 
 
 def _search_via_requests(

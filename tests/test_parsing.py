@@ -4,6 +4,8 @@ All fixtures here are synthetic: hand-written markup that mimics the *shape*
 of a results page (anchors + aria-labels). Never commit real Google responses.
 """
 
+import pytest
+
 from glens.lens import (
     _harvest_anchors,
     _is_external,
@@ -169,4 +171,34 @@ def test_blank_aria_label_anchors_still_become_matches():
     matches = _to_matches(_parse_anchors_from_html(BLANK_ARIA_HTML), 10)
     assert [m.domain for m in matches] == [
         "merchant.example", "other.example", "third.example",
+    ]
+
+
+@pytest.mark.parametrize("html, title", [
+    ('<a href="https://shop.example/p" aria-label="Men\'s Trail Shoe">tile</a>',
+     "Men's Trail Shoe"),
+    ("<a href='https://shop.example/p' aria-label='Acme 12\" Trail Shoe'>tile</a>",
+     'Acme 12" Trail Shoe'),
+    ('<a href="https://shop.example/p" aria-label="Acme > Trail Shoe">tile</a>',
+     "Acme > Trail Shoe"),
+    ('<a href=https://shop.example/p><img alt="Acme Trail Shoe"></a>',
+     "Acme Trail Shoe"),
+    ('<a href="https://shop.example/p" aria-label=" &nbsp; ">'
+     '<img alt="Acme Trail Shoe"></a>', "Acme Trail Shoe"),
+])
+def test_html_attribute_syntax_and_image_labels_preserve_titles(html, title):
+    items = _parse_anchors_from_html(html)
+    assert items == [{"href": "https://shop.example/p", "text": title}]
+    assert _to_matches(items, 1)[0].title == title
+
+
+def test_html_parser_ignores_fake_anchors_and_attribute_names():
+    html = '''
+    <!-- <a href="https://comment.example/p">Fake comment product</a> -->
+    <script>const tile = '<a href="https://script.example/p">Fake script product</a>';</script>
+    <a data-href="https://wrong.example/p" href="https://shop.example/p">Acme Trail Shoe</a>
+    <a data-href="https://wrong.example/p">No real link</a>
+    '''
+    assert _parse_anchors_from_html(html) == [
+        {"href": "https://shop.example/p", "text": "Acme Trail Shoe"},
     ]

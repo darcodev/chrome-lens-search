@@ -4,6 +4,10 @@ Notable changes to chrome-lens-search.
 
 ## Unreleased
 
+- Fixed: HTML anchor parsing preserves apostrophes, quotes and `>` inside labels, supports unquoted attributes and image-alt fallbacks, and ignores links inside comments or scripts. Merchant URLs are read from `href` rather than similarly named attributes such as `data-href`.
+- Fixed: malformed result-cache entries are treated as misses instead of crashing a lookup or returning invalid result fields. Non-finite cache timestamps no longer bypass expiry checks.
+- Fixed: malformed cookie jars are rejected before constructing an HTTP session, so health checks no longer report unusable jars as ready and searches can fall back to the browser.
+- Fixed: `glens warmup` reuses an existing valid jar without requiring the optional browser dependencies, matching the Python API. `--force` still requires the browser extra.
 - Fixed: an upload that never redirects is no longer mistaken for a results page. The check scanned the whole URL for `lens`, and the upload endpoint is itself on `lens.google.com` — so when the POST came back without a redirect, the `req` backend parsed the *upload response* as if it were results, then re-fetched the endpoint and took an HTTP error as the failure instead of the real one. Results URLs are now judged by host and path.
 - Fixed: a consent/`sorry` interstitial no longer ends the browser's address-bar poll. Those URLs carry the real destination in a `continue=` parameter, so the substring scan matched the word `lens` inside it and handed back the interstitial as the results URL; the poll now waits through the hop for the actual results page.
 - Fixed: the browser's wait-for-tiles check recognises Google's non-`.com` domains. It tested each link for the literal string `google.com`, so on `google.de`, `google.co.uk` or any other country domain the page's own nav and footer links counted as product tiles — the wait was satisfied immediately and the harvest ran before a single tile had rendered. It now matches hosts on label boundaries, like the rest of the library.

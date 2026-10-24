@@ -5,6 +5,8 @@ import logging
 import time
 import zlib
 
+import pytest
+
 import glens
 import glens.lens as lens_mod
 from glens.lens import _tiny_png
@@ -165,6 +167,29 @@ def test_status_jar_without_minted_at_reports_none_age(tmp_path):
 
 def test_status_is_json_safe(tmp_path):
     json.dumps(glens.status(cookie_file=tmp_path / "nope.json"))
+
+
+@pytest.mark.parametrize("invalid", [
+    {"cookies": 42},
+    {"cookies": "not a cookie list"},
+    {"cookies": [None]},
+    {"cookies": [{"value": "1"}]},
+    {"cookies": [{"name": "TEST", "value": 123}]},
+    {"cookies": [{"name": "TEST", "value": "1", "domain": []}]},
+    {"user_agent": ["not a user agent"]},
+])
+def test_malformed_cookie_jar_is_not_ready_or_used(tmp_path, invalid, monkeypatch):
+    jar = _write_valid_jar(tmp_path / "jar.json")
+    data = json.loads(jar.read_text(encoding="utf-8"))
+    data.update(invalid)
+    jar.write_text(json.dumps(data), encoding="utf-8")
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("malformed jars must be rejected before creating a session")
+
+    monkeypatch.setattr(lens_mod, "_req_session", no_network)
+    assert glens.status(cookie_file=jar)["req_ready"] is False
+    assert glens.search(b"synthetic-image", backend="req", cookie_file=jar) is None
 
 
 # ---------------------------------------------------------------------------
