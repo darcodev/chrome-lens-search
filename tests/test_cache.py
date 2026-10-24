@@ -196,11 +196,16 @@ def test_concurrent_writers_get_distinct_tmp_paths(monkeypatch, tmp_path, cache_
 
     key = _cache_key(b"synthetic-image", None)
     seen: list[str] = []
+    writers_ready = threading.Barrier(4)
     real_write_text = lens_mod.Path.write_text
 
     def spy(self, *args, **kwargs):
         if self.name.endswith(".tmp"):
             seen.append(self.name)
+            # Keep every writer alive until all have reached the write. Without
+            # this, a fast thread can finish before another starts, letting the
+            # OS reuse its id and making distinct concurrent paths look equal.
+            writers_ready.wait(timeout=10)
         return real_write_text(self, *args, **kwargs)
 
     monkeypatch.setattr(lens_mod.Path, "write_text", spy)
